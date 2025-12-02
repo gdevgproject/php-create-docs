@@ -1,33 +1,62 @@
 <?php
-// --- THIẾT LẬP MÔI TRƯỜNG VÀ XỬ LÝ LỖI ---
+// =================================================================================
+// CẤU HÌNH & THIẾT LẬP
+// =================================================================================
 set_time_limit(0);
 error_reporting(E_ALL);
 ini_set('display_errors', 0);
-ini_set('log_errors', 1);
-$php_error_log_file = __DIR__ . '/php_error.log';
-ini_set('error_log', $php_error_log_file);
+ini_set('memory_limit', '512M'); // Tăng bộ nhớ để xử lý chuỗi lớn
 
-// Tắt bộ đệm đầu ra
-@ini_set('zlib.output_compression', 0);
+// Tắt bộ đệm để SSE hoạt động mượt mà
 if (function_exists('apache_setenv')) {
   @apache_setenv('no-gzip', 1);
 }
+@ini_set('zlib.output_compression', 0);
 @ini_set('implicit_flush', 1);
 ob_implicit_flush(1);
 
-// File log
-$log_file = __DIR__ . '/docs_generator.log';
+// File lưu trữ bookmark & Temp folder
+$bookmarkFile = __DIR__ . '/saved_paths.json';
+$tempDir = __DIR__ . '/temp_docs'; // Nơi lưu file tạm
 
-function write_log($message)
-{
-  global $log_file;
-  file_put_contents($log_file, '[' . date('Y-m-d H:i:s') . '] ' . $message . PHP_EOL, FILE_APPEND);
-}
+// --- DANH SÁCH LOẠI TRỪ (EXCLUSIONS) ---
+const EXCLUDED_DIRS = [
+  'node_modules',
+  '.next',
+  'vendor',
+  '.git',
+  '.idea',
+  '.vscode',
+  'public',
+  'dist',
+  'build',
+  'out',
+  'storage',
+  'coverage',
+  '__pycache__',
+  'tmp',
+  'temp',
+  'logs'
+];
 
-// --- CẤU HÌNH ---
-const EXCLUDED_DIRS = ['node_modules', '.next', 'vendor', '.git', 'public', 'dist', 'build', 'storage', '.idea', '.vscode'];
-const EXCLUDED_FILES = ['.env', '.env.local', 'package-lock.json', 'composer.lock', '.DS_Store', 'yarn.lock'];
-const EXCLUDED_EXTENSIONS = [
+const EXCLUDED_FILES = [
+  '.env',
+  '.env.local',
+  '.env.example',
+  '.env.production', // Sensitive
+  'package-lock.json',
+  'composer.lock',
+  'yarn.lock',
+  'pnpm-lock.yaml',
+  '.DS_Store',
+  'Thumbs.db',
+  'desktop.ini',
+  'tsconfig.tsbuildinfo', // Build info garbage
+  'mix-manifest.json',
+  'manifest.json'
+];
+
+const BINARY_EXTENSIONS = [
   'png',
   'jpg',
   'jpeg',
@@ -36,6 +65,8 @@ const EXCLUDED_EXTENSIONS = [
   'svg',
   'webp',
   'ico',
+  'tif',
+  'tiff',
   'mp3',
   'wav',
   'ogg',
@@ -43,210 +74,317 @@ const EXCLUDED_EXTENSIONS = [
   'mov',
   'avi',
   'webm',
+  'mkv',
   'pdf',
   'doc',
   'docx',
   'xls',
   'xlsx',
+  'ppt',
+  'pptx',
   'zip',
   'rar',
   '7z',
+  'tar',
+  'gz',
+  'iso',
   'ttf',
   'otf',
   'woff',
   'woff2',
   'eot',
-  'phar',
   'exe',
-  'dll'
+  'dll',
+  'so',
+  'dylib',
+  'class',
+  'jar',
+  'phar',
+  'bin',
+  'obj',
+  'pyc'
 ];
-$resultsDir = __DIR__ . '/generated_docs';
 
-// --- ROUTING ---
-// 1. Generate Full Docs (SSE)
-if (isset($_GET['action']) && $_GET['action'] == 'generate' && isset($_GET['path'])) {
+// =================================================================================
+// ROUTING & XỬ LÝ REQUEST
+// =================================================================================
+
+$action = $_GET['action'] ?? '';
+
+// 1. API: Lấy danh sách Bookmark
+if ($action === 'get_bookmarks') {
+  json_response(get_bookmarks());
+}
+
+// 2. API: Lưu Bookmark
+if ($action === 'save_bookmark') {
+  $data = json_decode(file_get_contents('php://input'), true);
+  if (!empty($data['path'])) {
+    $bookmarks = get_bookmarks();
+    $id = uniqid();
+    $bookmarks[$id] = [
+      'id' => $id,
+      'path' => clean_path($data['path']),
+      'note' => $data['note'] ?? '',
+      'created_at' => date('Y-m-d H:i:s')
+    ];
+    save_bookmarks($bookmarks);
+    json_response(['status' => 'success', 'data' => $bookmarks]);
+  }
+  json_response(['status' => 'error', 'message' => 'Path is required']);
+}
+
+// 3. API: Xóa Bookmark
+if ($action === 'delete_bookmark') {
+  $data = json_decode(file_get_contents('php://input'), true);
+  if (!empty($data['id'])) {
+    $bookmarks = get_bookmarks();
+    if (isset($bookmarks[$data['id']])) {
+      unset($bookmarks[$data['id']]);
+      save_bookmarks($bookmarks);
+    }
+    json_response(['status' => 'success', 'data' => $bookmarks]);
+  }
+  json_response(['status' => 'error']);
+}
+
+// 4. API: Lấy Structure Tree (JSON)
+if ($action === 'get_structure') {
+  $path = clean_path($_GET['path'] ?? '');
+  if (!is_dir($path)) json_response(['status' => 'error', 'message' => 'Đường dẫn không hợp lệ.']);
+
+  try {
+    $files = scan_project_files($path);
+    $treeString = '';
+    generate_directory_tree($path, $files, $treeString);
+    json_response(['status' => 'success', 'data' => $treeString, 'count' => count($files)]);
+  } catch (Exception $e) {
+    json_response(['status' => 'error', 'message' => $e->getMessage()]);
+  }
+}
+
+// 5. API: Lấy nội dung file đã generate (cho Preview)
+if ($action === 'get_content') {
+  $filename = basename($_GET['file']);
+  $filePath = $tempDir . '/' . $filename;
+  if (file_exists($filePath)) {
+    echo file_get_contents($filePath);
+  } else {
+    echo "File không tồn tại hoặc đã bị xóa.";
+  }
+  exit;
+}
+
+// 6. SSE: Generate Full Docs
+if ($action === 'generate') {
   handle_generation_request();
   exit;
 }
-// 2. Download File
+
+// 7. Download File
 if (isset($_GET['download'])) {
   handle_download_request();
   exit;
 }
-// 3. Get Structure Only (AJAX JSON)
-if (isset($_GET['action']) && $_GET['action'] == 'get_structure' && isset($_GET['path'])) {
-  handle_structure_request();
-  exit;
+
+// =================================================================================
+// LOGIC CHÍNH
+// =================================================================================
+
+function clean_path($path)
+{
+  return trim(urldecode($path), " \"'\t\n\r\0\x0B");
 }
 
-// --- LOGIC CHÍNH ---
+function get_bookmarks()
+{
+  global $bookmarkFile;
+  if (!file_exists($bookmarkFile)) return [];
+  return json_decode(file_get_contents($bookmarkFile), true) ?? [];
+}
 
-// Xử lý lấy cây thư mục (Structure Only)
-function handle_structure_request()
+function save_bookmarks($data)
+{
+  global $bookmarkFile;
+  file_put_contents($bookmarkFile, json_encode($data, JSON_PRETTY_PRINT));
+}
+
+function json_response($data)
 {
   header('Content-Type: application/json');
-  try {
-    $projectPath = rtrim(urldecode($_GET['path']), '\\/');
-    if (!is_dir($projectPath)) throw new Exception("Đường dẫn không hợp lệ.");
-
-    $filesToProcess = get_files_to_process($projectPath);
-    $treeString = '';
-    generate_directory_tree($projectPath, $filesToProcess, $treeString);
-
-    echo json_encode([
-      'status' => 'success',
-      'data' => $treeString,
-      'count' => count($filesToProcess)
-    ]);
-  } catch (Throwable $e) {
-    echo json_encode([
-      'status' => 'error',
-      'message' => $e->getMessage()
-    ]);
-  }
+  echo json_encode($data);
   exit;
 }
 
-// Xử lý tạo Full Docs (SSE)
 function handle_generation_request()
 {
-  global $resultsDir;
+  global $tempDir;
   header('Content-Type: text/event-stream');
   header('Cache-Control: no-cache');
   header('Connection: keep-alive');
 
+  $projectPath = clean_path($_GET['path'] ?? '');
+
   try {
-    write_log("================== NEW FULL REQUEST ==================");
-    $projectPath = rtrim(urldecode($_GET['path']), '\\/');
+    if (!is_dir($projectPath)) throw new Exception("Đường dẫn không tồn tại.");
 
-    if (!is_dir($projectPath)) throw new Exception("Đường dẫn không hợp lệ.");
-    if (!is_dir($resultsDir)) mkdir($resultsDir, 0777, true);
+    // Tạo thư mục temp nếu chưa có
+    if (!is_dir($tempDir)) mkdir($tempDir, 0777, true);
 
-    send_sse_message('log', 'Bước 1: Quét file...');
-    $filesToProcess = get_files_to_process($projectPath);
-    $totalFiles = count($filesToProcess);
+    // Dọn dẹp file cũ trong temp (để tiết kiệm dung lượng)
+    $oldFiles = glob($tempDir . '/docs_*.md');
+    foreach ($oldFiles as $f) {
+      if (is_file($f) && (time() - filemtime($f) > 3600)) { // Xóa file cũ hơn 1 tiếng
+        unlink($f);
+      }
+    }
 
-    if ($totalFiles === 0) throw new Exception("Không tìm thấy file hợp lệ.");
+    send_sse('log', '🚀 Bắt đầu quét file...');
+    $files = scan_project_files($projectPath);
+    $totalFiles = count($files);
 
-    send_sse_message('log', "Tìm thấy {$totalFiles} file. Đang xử lý...");
-    $markdownContent = generate_markdown($projectPath, $filesToProcess);
+    if ($totalFiles === 0) throw new Exception("Không tìm thấy file nào hợp lệ.");
 
-    $safeFilename = preg_replace('/[^A-Za-z0-9_\-]/', '_', basename($projectPath));
-    $outputFilename = 'docs_' . $safeFilename . '_' . date('YmdHis') . '.md';
-    $outputFilePath = $resultsDir . '/' . $outputFilename;
+    send_sse('log', "📦 Tìm thấy {$totalFiles} file. Đang xử lý...");
 
-    file_put_contents($outputFilePath, $markdownContent);
-    send_sse_message('complete', basename($outputFilePath), ['total' => $totalFiles]);
+    // Tạo nội dung Markdown
+    $projectName = basename($projectPath);
+    $markdown = "# Tài liệu dự án: " . $projectName . "\n\n";
+    $markdown .= "Ngày tạo: " . date('Y-m-d H:i:s') . "\n";
+    $markdown .= "Tổng số file: " . $totalFiles . "\n\n";
+
+    // Phần 1: Cấu trúc cây
+    $treeString = '';
+    generate_directory_tree($projectPath, $files, $treeString);
+    $markdown .= "## 🌳 Cấu trúc thư mục\n\n```text\n" . $treeString . "```\n\n";
+
+    // Phần 2: Nội dung chi tiết
+    $markdown .= "## 📄 Nội dung chi tiết\n\n";
+
+    foreach ($files as $index => $filePath) {
+      $processedCount = $index + 1;
+      $relativePath = ltrim(str_replace(str_replace('\\', '/', $projectPath), '', str_replace('\\', '/', $filePath)), '/');
+
+      // SSE Progress
+      if ($processedCount % 5 == 0 || $processedCount == $totalFiles) {
+        $percent = round(($processedCount / $totalFiles) * 100);
+        send_sse('progress', "Đang đọc: $relativePath", ['percent' => $percent]);
+      }
+
+      $ext = strtolower(pathinfo($filePath, PATHINFO_EXTENSION));
+      $markdown .= "### `{$relativePath}`\n\n";
+
+      if (in_array($ext, BINARY_EXTENSIONS)) {
+        $markdown .= "> _[File Binary/Media - Không hiển thị nội dung]_\n\n";
+      } else {
+        $content = @file_get_contents($filePath);
+        if ($content === false) {
+          $markdown .= "> _[Lỗi đọc file]_\n\n";
+        } elseif (strlen($content) > 512 * 1024) { // > 512KB
+          $markdown .= "> _[File quá lớn (>512KB) - Đã ẩn nội dung]_\n\n";
+        } else {
+          if (empty($ext)) $ext = 'text';
+          $markdown .= "```{$ext}\n" . $content . "\n```\n\n";
+        }
+      }
+    }
+
+    // Lưu file vào thư mục temp của PHP
+    $safeName = preg_replace('/[^A-Za-z0-9_\-]/', '_', $projectName);
+    $fileName = 'docs_' . $safeName . '_' . date('Ymd_His') . '.md';
+    $tempFilePath = $tempDir . '/' . $fileName;
+
+    if (file_put_contents($tempFilePath, $markdown) === false) {
+      throw new Exception("Lỗi ghi file tạm.");
+    }
+
+    // Trả về tên file để client tải hoặc preview
+    send_sse('complete', $fileName, ['total' => $totalFiles]);
   } catch (Throwable $e) {
-    write_log("Error: " . $e->getMessage());
-    send_sse_message('error', $e->getMessage());
+    send_sse('error', $e->getMessage());
   }
 }
 
-function handle_download_request()
+function scan_project_files($dir)
 {
-  global $resultsDir;
-  $fileName = basename($_GET['download']);
-  $filePath = $resultsDir . '/' . $fileName;
-
-  if (file_exists($filePath)) {
-    header('Content-Type: text/markdown');
-    header('Content-Disposition: attachment; filename="' . $fileName . '"');
-    readfile($filePath);
-    exit;
-  }
-  http_response_code(404);
-  die('File not found.');
-}
-
-function send_sse_message($event, $data, $extra = [])
-{
-  echo "event: {$event}\n";
-  echo "data: " . json_encode(array_merge(['message' => $data], $extra)) . "\n\n";
-  if (ob_get_level() > 0) ob_flush();
-  flush();
-}
-
-function get_files_to_process($dirPath)
-{
-  $fileList = [];
-  $directoryIterator = new RecursiveDirectoryIterator($dirPath, FilesystemIterator::SKIP_DOTS | FilesystemIterator::UNIX_PATHS);
+  $results = [];
   $iterator = new RecursiveIteratorIterator(
-    new class($directoryIterator) extends RecursiveFilterIterator {
-      public function accept(): bool
-      {
-        $current = $this->current();
-        if ($current->isDir() && in_array($current->getFilename(), EXCLUDED_DIRS)) return false;
+    new RecursiveCallbackFilterIterator(
+      new RecursiveDirectoryIterator($dir, FilesystemIterator::SKIP_DOTS | FilesystemIterator::UNIX_PATHS),
+      function ($current, $key, $iterator) {
+        $filename = $current->getFilename();
+        if ($current->isDir()) return !in_array($filename, EXCLUDED_DIRS);
+        if ($current->isFile()) return !in_array($filename, EXCLUDED_FILES);
         return true;
       }
-    },
+    ),
     RecursiveIteratorIterator::SELF_FIRST
   );
 
   foreach ($iterator as $file) {
-    if ($file->isFile()) {
-      if (!in_array($file->getFilename(), EXCLUDED_FILES) && !in_array(strtolower($file->getExtension()), EXCLUDED_EXTENSIONS)) {
-        $fileList[] = $file->getPathname();
-      }
-    }
+    if ($file->isFile()) $results[] = $file->getPathname();
   }
-  return $fileList;
+  sort($results);
+  return $results;
 }
 
-function generate_directory_tree($path, $filesToProcess, &$treeString)
+function generate_directory_tree($rootPath, $files, &$treeString)
 {
-  $relativePathRoot = str_replace('\\', '/', $path);
+  $rootPath = str_replace('\\', '/', $rootPath);
   $structure = [];
-  foreach ($filesToProcess as $file) {
-    $relativePath = ltrim(str_replace($relativePathRoot, '', str_replace('\\', '/', $file)), '/');
+  foreach ($files as $file) {
+    $file = str_replace('\\', '/', $file);
+    $relativePath = ltrim(str_replace($rootPath, '', $file), '/');
     $parts = explode('/', $relativePath);
-    $currentNode = &$structure;
+    $current = &$structure;
     foreach ($parts as $part) {
-      if (!isset($currentNode[$part])) $currentNode[$part] = [];
-      $currentNode = &$currentNode[$part];
+      if (!isset($current[$part])) $current[$part] = [];
+      $current = &$current[$part];
     }
   }
-  $treeString .= basename($path) . "\n";
-  build_tree_string($structure, $treeString);
+  $treeString .= basename($rootPath) . "/\n";
+  print_tree($structure, $treeString);
 }
 
-function build_tree_string($tree, &$treeString, $prefix = '')
+function print_tree($structure, &$output, $prefix = '')
 {
-  $nodes = array_keys($tree);
-  $count = count($nodes);
-  foreach ($nodes as $i => $node) {
-    $isLast = ($i === $count - 1);
-    $treeString .= $prefix . ($isLast ? '└── ' : '├── ') . $node . "\n";
-    if (!empty($tree[$node])) {
-      build_tree_string($tree[$node], $treeString, $prefix . ($isLast ? '    ' : '│   '));
-    }
+  $keys = array_keys($structure);
+  $lastIndex = count($keys) - 1;
+  foreach ($keys as $index => $key) {
+    $isLast = ($index === $lastIndex);
+    $marker = $isLast ? '└── ' : '├── ';
+    $subPrefix = $isLast ? '    ' : '│   ';
+    $output .= $prefix . $marker . $key . "\n";
+    if (!empty($structure[$key])) print_tree($structure[$key], $output, $prefix . $subPrefix);
   }
 }
 
-function generate_markdown($dirPath, $filesToProcess)
+function send_sse($event, $message, $data = [])
 {
-  $treeString = '';
-  generate_directory_tree($dirPath, $filesToProcess, $treeString);
+  echo "event: $event\n";
+  echo "data: " . json_encode(array_merge(['message' => $message], $data)) . "\n\n";
+  if (ob_get_level() > 0) ob_flush();
+  flush();
+}
 
-  $markdownContent = "# Tài liệu dự án: " . basename($dirPath) . "\n\n";
-  $markdownContent .= "Ngày tạo: " . date('Y-m-d H:i:s') . "\n\n";
-  $markdownContent .= "## 🌳 Cấu trúc thư mục\n\n```text\n" . $treeString . "```\n\n";
-  $markdownContent .= "## 📄 Nội dung chi tiết\n\n";
+function handle_download_request()
+{
+  global $tempDir;
+  $fileName = basename($_GET['download']);
+  $filePath = $tempDir . '/' . $fileName;
 
-  $totalFiles = count($filesToProcess);
-  foreach ($filesToProcess as $index => $filePath) {
-    $processedCount = $index + 1;
-    $relativePath = ltrim(str_replace(str_replace('\\', '/', $dirPath), '', str_replace('\\', '/', $filePath)), '/');
-
-    send_sse_message('progress', "Đang xử lý: {$relativePath}", ['progress' => round(($processedCount / $totalFiles) * 100)]);
-
-    $ext = pathinfo($filePath, PATHINFO_EXTENSION);
-    $markdownContent .= "### `{$relativePath}`\n\n```{$ext}\n";
-    $content = @file_get_contents($filePath);
-    $markdownContent .= ($content === false ? "Lỗi đọc file" : htmlspecialchars($content, ENT_QUOTES, 'UTF-8'));
-    $markdownContent .= "\n```\n\n";
+  if (file_exists($filePath)) {
+    header('Content-Description: File Transfer');
+    header('Content-Type: application/octet-stream');
+    header('Content-Disposition: attachment; filename="' . $fileName . '"');
+    header('Expires: 0');
+    header('Cache-Control: must-revalidate');
+    header('Content-Length: ' . filesize($filePath));
+    readfile($filePath);
+    exit;
+  } else {
+    die("File không tồn tại hoặc đã hết hạn.");
   }
-  return $markdownContent;
 }
 ?>
 <!DOCTYPE html>
@@ -255,388 +393,656 @@ function generate_markdown($dirPath, $filesToProcess)
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Markdown Docs Generator</title>
+  <title>Smart Docs Generator</title>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
   <style>
     :root {
-      --primary: #3498db;
-      --success: #27ae60;
-      --dark: #2c3e50;
-      --light: #ecf0f1;
-      --danger: #e74c3c;
+      --primary: #2563eb;
+      --primary-hover: #1d4ed8;
+      --bg: #f8fafc;
+      --surface: #ffffff;
+      --text: #0f172a;
+      --text-sec: #64748b;
+      --border: #e2e8f0;
+      --success: #10b981;
+      --error: #ef4444;
+      --code-bg: #1e293b;
+      --code-text: #e2e8f0;
+    }
+
+    * {
+      box-sizing: border-box;
     }
 
     body {
-      font-family: -apple-system, system-ui, sans-serif;
-      line-height: 1.6;
-      max-width: 800px;
-      margin: 40px auto;
-      padding: 20px;
-      background: #f4f4f4;
-      color: #333;
-    }
-
-    .container {
-      background: #fff;
-      padding: 30px;
-      border-radius: 8px;
-      box-shadow: 0 4px 15px rgba(0, 0, 0, 0.1);
-    }
-
-    h1 {
-      text-align: center;
-      color: var(--dark);
-      margin-bottom: 30px;
-    }
-
-    .input-group {
-      margin-bottom: 20px;
-    }
-
-    label {
-      display: block;
-      margin-bottom: 8px;
-      font-weight: 600;
-    }
-
-    input[type="text"] {
-      width: 100%;
-      padding: 12px;
-      border: 1px solid #ddd;
-      border-radius: 6px;
-      box-sizing: border-box;
-      font-size: 16px;
-    }
-
-    .btn-group {
+      font-family: 'Inter', sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      margin: 0;
+      height: 100vh;
       display: flex;
-      gap: 10px;
-    }
-
-    button {
-      flex: 1;
-      padding: 12px;
-      border: none;
-      border-radius: 6px;
-      cursor: pointer;
-      font-size: 16px;
-      font-weight: 600;
-      transition: 0.2s;
-      color: white;
-    }
-
-    button:disabled {
-      opacity: 0.6;
-      cursor: not-allowed;
-    }
-
-    #btn-full {
-      background-color: var(--primary);
-    }
-
-    #btn-full:hover:not(:disabled) {
-      background-color: #2980b9;
-    }
-
-    #btn-structure {
-      background-color: #9b59b6;
-    }
-
-    #btn-structure:hover:not(:disabled) {
-      background-color: #8e44ad;
-    }
-
-    /* Progress & Logs */
-    #progress-container {
-      display: none;
-      margin-top: 25px;
-    }
-
-    #progress-bar {
-      background: var(--light);
-      border-radius: 4px;
       overflow: hidden;
-      height: 20px;
     }
 
-    #progress-bar-inner {
-      width: 0%;
-      height: 100%;
-      background: var(--success);
-      transition: width 0.3s;
-      text-align: center;
-      color: #fff;
-      font-size: 12px;
-      line-height: 20px;
-    }
-
-    #log {
-      margin-top: 15px;
-      padding: 15px;
-      background: var(--dark);
-      color: var(--light);
-      border-radius: 6px;
-      height: 150px;
-      overflow-y: auto;
-      font-family: monospace;
-      font-size: 13px;
-      white-space: pre-wrap;
-    }
-
-    #result-download {
-      text-align: center;
-      margin-top: 20px;
-      display: none;
-    }
-
-    .download-link {
-      display: inline-block;
-      padding: 10px 20px;
-      background: var(--success);
-      color: white;
-      text-decoration: none;
-      border-radius: 6px;
-    }
-
-    /* Modal Structure Preview */
-    .modal-overlay {
-      display: none;
-      position: fixed;
-      top: 0;
-      left: 0;
-      width: 100%;
-      height: 100%;
-      background: rgba(0, 0, 0, 0.5);
-      z-index: 100;
-      align-items: center;
-      justify-content: center;
-    }
-
-    .modal-content {
-      background: white;
-      width: 90%;
-      max-width: 800px;
-      max-height: 90vh;
-      border-radius: 8px;
+    /* SIDEBAR */
+    .sidebar {
+      width: 320px;
+      background: var(--surface);
+      border-right: 1px solid var(--border);
       display: flex;
       flex-direction: column;
       padding: 20px;
-      position: relative;
+      flex-shrink: 0;
     }
 
-    .modal-header {
+    .brand {
+      font-size: 1.25rem;
+      font-weight: 700;
+      color: var(--primary);
+      margin-bottom: 20px;
       display: flex;
-      justify-content: space-between;
       align-items: center;
-      margin-bottom: 15px;
-      border-bottom: 1px solid #eee;
-      padding-bottom: 10px;
-    }
-
-    .modal-title {
-      font-weight: bold;
-      font-size: 18px;
-    }
-
-    .close-modal {
-      background: none;
-      border: none;
-      color: #999;
-      font-size: 24px;
-      cursor: pointer;
-      padding: 0;
-      flex: 0;
-    }
-
-    .close-modal:hover {
-      color: var(--danger);
-    }
-
-    .preview-area {
-      flex: 1;
-      overflow: auto;
-      background: #f8f9fa;
-      padding: 15px;
-      border-radius: 4px;
-      border: 1px solid #ddd;
-      font-family: 'Courier New', monospace;
-      white-space: pre;
-      margin-bottom: 15px;
-    }
-
-    .modal-footer {
-      display: flex;
-      justify-content: flex-end;
       gap: 10px;
     }
 
-    .btn-copy {
-      background-color: var(--success);
-      width: auto;
-      padding: 10px 25px;
+    /* FORM */
+    .input-group {
+      margin-bottom: 15px;
+    }
+
+    .input-group label {
+      display: block;
+      font-size: 0.85rem;
+      font-weight: 600;
+      margin-bottom: 6px;
+      color: var(--text-sec);
+    }
+
+    .input-control {
+      width: 100%;
+      padding: 10px;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.9rem;
+      transition: 0.2s;
+    }
+
+    .input-control:focus {
+      outline: none;
+      border-color: var(--primary);
+      box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.1);
+    }
+
+    .btn {
+      width: 100%;
+      padding: 10px;
+      border: none;
+      border-radius: 6px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: 0.2s;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      font-size: 0.95rem;
+    }
+
+    .btn-primary {
+      background: var(--primary);
+      color: white;
+    }
+
+    .btn-primary:hover:not(:disabled) {
+      background: var(--primary-hover);
+    }
+
+    .btn-secondary {
+      background: #f1f5f9;
+      color: var(--text);
+      border: 1px solid var(--border);
+    }
+
+    .btn-secondary:hover {
+      background: #e2e8f0;
+    }
+
+    .btn-outline {
+      background: transparent;
+      border: 1px solid var(--border);
+      color: var(--text-sec);
+    }
+
+    .btn:disabled {
+      opacity: 0.6;
+      cursor: wait;
+    }
+
+    /* BOOKMARKS */
+    .bookmarks-area {
+      flex: 1;
+      overflow-y: auto;
+      margin-top: 20px;
+      border-top: 1px solid var(--border);
+      padding-top: 15px;
+    }
+
+    .bm-title {
+      font-size: 0.8rem;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--text-sec);
+      font-weight: 700;
+      margin-bottom: 10px;
+    }
+
+    .bm-item {
+      background: #f8fafc;
+      border: 1px solid var(--border);
+      padding: 10px;
+      border-radius: 6px;
+      margin-bottom: 8px;
+      transition: 0.2s;
+      position: relative;
+    }
+
+    .bm-item:hover {
+      border-color: var(--primary);
+      background: #eff6ff;
+    }
+
+    .bm-name {
+      font-weight: 600;
+      font-size: 0.9rem;
+      margin-bottom: 4px;
+    }
+
+    .bm-path {
+      font-family: 'JetBrains Mono';
+      font-size: 0.75rem;
+      color: var(--text-sec);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .bm-del {
+      position: absolute;
+      top: 8px;
+      right: 8px;
+      background: none;
+      border: none;
+      color: #cbd5e1;
+      cursor: pointer;
+      font-size: 1.2rem;
+      line-height: 0.5;
+      padding: 5px;
+    }
+
+    .bm-del:hover {
+      color: var(--error);
+    }
+
+    .bm-item:hover .bm-del {
+      display: block;
+    }
+
+    /* MAIN CONTENT */
+    .main {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      padding: 20px;
+      overflow: hidden;
+      position: relative;
+    }
+
+    /* PREVIEW AREA */
+    .preview-container {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      background: var(--surface);
+      border-radius: 12px;
+      box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05);
+      overflow: hidden;
+      border: 1px solid var(--border);
+    }
+
+    .preview-header {
+      padding: 12px 20px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      background: #fff;
+    }
+
+    .preview-title {
+      font-weight: 600;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .badge {
+      font-size: 0.75rem;
+      padding: 2px 8px;
+      border-radius: 99px;
+      background: #e2e8f0;
+      color: var(--text-sec);
+    }
+
+    .editor-wrapper {
+      flex: 1;
+      position: relative;
+      background: var(--code-bg);
+    }
+
+    textarea.code-editor {
+      width: 100%;
+      height: 100%;
+      border: none;
+      padding: 20px;
+      resize: none;
+      background: var(--code-bg);
+      color: var(--code-text);
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 13px;
+      line-height: 1.6;
+      outline: none;
+    }
+
+    /* ACTIONS BAR */
+    .actions {
+      display: flex;
+      gap: 10px;
+    }
+
+    .toast {
+      position: fixed;
+      top: 20px;
+      right: 20px;
+      background: var(--code-bg);
+      color: white;
+      padding: 10px 20px;
+      border-radius: 6px;
+      box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1);
+      opacity: 0;
+      transition: 0.3s;
+      transform: translateY(-10px);
+      z-index: 100;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .toast.show {
+      opacity: 1;
+      transform: translateY(0);
+    }
+
+    /* PROGRESS & LOGS OVERLAY */
+    .overlay-status {
+      position: absolute;
+      bottom: 30px;
+      left: 30px;
+      right: 30px;
+      background: rgba(255, 255, 255, 0.95);
+      backdrop-filter: blur(5px);
+      padding: 15px;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.1);
+      display: none;
+      z-index: 50;
+    }
+
+    .progress-bar {
+      height: 6px;
+      background: #e2e8f0;
+      border-radius: 3px;
+      overflow: hidden;
+      margin-bottom: 10px;
+    }
+
+    .progress-fill {
+      height: 100%;
+      background: var(--primary);
+      width: 0%;
+      transition: width 0.2s;
+    }
+
+    .log-text {
+      font-family: 'JetBrains Mono';
+      font-size: 0.8rem;
+      color: var(--text-sec);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    /* MODAL (Structure) */
+    .modal {
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: rgba(0, 0, 0, 0.5);
+      z-index: 999;
+      justify-content: center;
+      align-items: center;
+    }
+
+    .modal-box {
+      background: white;
+      width: 800px;
+      height: 80vh;
+      border-radius: 12px;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    .modal-body {
+      flex: 1;
+      padding: 20px;
+      overflow: auto;
+      background: #f8fafc;
+      font-family: 'JetBrains Mono';
+      font-size: 13px;
+      white-space: pre;
+    }
+
+    .modal-head {
+      padding: 15px 20px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-weight: 600;
     }
   </style>
 </head>
 
 <body>
-  <div class="container">
-    <h1>Công cụ tạo tài liệu dự án</h1>
+
+  <!-- LEFT SIDEBAR -->
+  <div class="sidebar">
+    <div class="brand">🚀 Docs Generator</div>
 
     <div class="input-group">
-      <label for="project_path">Đường dẫn thư mục dự án:</label>
-      <input type="text" id="project_path" placeholder="Ví dụ: C:\laragon\www\my-project" required>
+      <label>📂 Project Path</label>
+      <input type="text" id="path-input" class="input-control" placeholder="C:\laragon\www\my-project" onblur="cleanInput(this)">
     </div>
 
-    <div class="btn-group">
-      <button id="btn-full">🚀 Tạo Full Docs (Nội dung)</button>
-      <button id="btn-structure">🌳 Chỉ lấy Structure Tree</button>
+    <div style="display: flex; gap: 10px; margin-bottom: 15px;">
+      <button class="btn btn-secondary" onclick="getStructure()">🌳 Structure</button>
+      <button class="btn btn-primary" id="btn-gen" onclick="startGenerate()">⚡ Generate</button>
     </div>
 
-    <!-- Progress Area -->
-    <div id="progress-container">
-      <div id="progress-bar">
-        <div id="progress-bar-inner">0%</div>
+    <div class="input-group" style="margin-top: auto; border-top: 1px dashed var(--border); padding-top: 15px;">
+      <label>🔖 Bookmark Note</label>
+      <div style="display: flex; gap: 5px;">
+        <input type="text" id="bm-note" class="input-control" placeholder="Tên dự án...">
+        <button class="btn btn-secondary" style="width: auto;" onclick="addBookmark()">+</button>
       </div>
-      <div id="log"></div>
     </div>
-    <div id="result-download"><a href="#" class="download-link" id="download-link">⬇️ Tải xuống file .MD</a></div>
+
+    <div class="bookmarks-area">
+      <div class="bm-title">Saved Paths</div>
+      <div id="bm-list"></div>
+    </div>
   </div>
 
-  <!-- Modal Preview -->
-  <div class="modal-overlay" id="preview-modal">
-    <div class="modal-content">
-      <div class="modal-header">
-        <div class="modal-title">Structure Tree Preview</div>
-        <button class="close-modal" onclick="closeModal()">&times;</button>
+  <!-- MAIN AREA -->
+  <div class="main">
+    <div class="preview-container">
+      <div class="preview-header">
+        <div class="preview-title">
+          📄 Preview <span class="badge" id="file-badge">Empty</span>
+        </div>
+        <div class="actions">
+          <button class="btn btn-outline btn-sm" onclick="copyContent()" id="btn-copy" disabled>📋 Copy Markdown</button>
+          <a href="#" id="btn-download" class="btn btn-primary btn-sm" style="text-decoration: none; pointer-events: none; opacity: 0.6;">⬇️ Download .MD</a>
+        </div>
       </div>
-      <div class="preview-area" id="tree-preview-content">Đang tải...</div>
-      <div class="modal-footer">
-        <div id="copy-status" style="margin-right: auto; color: var(--success); display: none;">Đã copy!</div>
-        <button class="btn-copy" onclick="copyTree()">📋 Copy to Clipboard</button>
+      <div class="editor-wrapper">
+        <textarea id="editor" class="code-editor" readonly placeholder="Nội dung docs sẽ hiện ở đây..."></textarea>
       </div>
+    </div>
+
+    <!-- STATUS OVERLAY -->
+    <div class="overlay-status" id="status-panel">
+      <div style="display: flex; justify-content: space-between; margin-bottom: 5px; font-weight: 600; font-size: 0.9rem;">
+        <span>Generating...</span>
+        <span id="percent-text">0%</span>
+      </div>
+      <div class="progress-bar">
+        <div class="progress-fill" id="progress-fill"></div>
+      </div>
+      <div class="log-text" id="log-text">Initializing...</div>
+    </div>
+  </div>
+
+  <!-- TOAST -->
+  <div class="toast" id="toast">✅ Copied to clipboard!</div>
+
+  <!-- MODAL STRUCTURE -->
+  <div class="modal" id="modal-struct">
+    <div class="modal-box">
+      <div class="modal-head">
+        <span>🌳 Project Structure</span>
+        <div style="display: flex; gap: 10px;">
+          <button class="btn btn-secondary btn-sm" style="width: auto" onclick="copyStructure()">📋 Copy Raw</button>
+          <button class="btn btn-outline btn-sm" style="width: auto" onclick="closeModal()">✕</button>
+        </div>
+      </div>
+      <div class="modal-body" id="struct-content"></div>
     </div>
   </div>
 
   <script>
-    const pathInput = document.getElementById('project_path');
-    const logDiv = document.getElementById('log');
-    const progressContainer = document.getElementById('progress-container');
-    const progressBarInner = document.getElementById('progress-bar-inner');
-    const resultDownload = document.getElementById('result-download');
+    // DOM Elements
+    const dom = {
+      path: document.getElementById('path-input'),
+      note: document.getElementById('bm-note'),
+      bmList: document.getElementById('bm-list'),
+      editor: document.getElementById('editor'),
+      btnGen: document.getElementById('btn-gen'),
+      statusPanel: document.getElementById('status-panel'),
+      pFill: document.getElementById('progress-fill'),
+      pText: document.getElementById('percent-text'),
+      logText: document.getElementById('log-text'),
+      btnCopy: document.getElementById('btn-copy'),
+      btnDl: document.getElementById('btn-download'),
+      badge: document.getElementById('file-badge'),
+      modal: document.getElementById('modal-struct'),
+      structContent: document.getElementById('struct-content'),
+      toast: document.getElementById('toast')
+    };
 
-    // --- LOGIC FULL DOCS (SSE) ---
-    document.getElementById('btn-full').addEventListener('click', function() {
-      const path = pathInput.value.trim();
-      if (!path) return alert('Vui lòng nhập đường dẫn!');
+    // --- UTILS ---
+    function cleanInput(el) {
+      // Tự động xóa dấu ngoặc kép khi paste
+      el.value = el.value.replace(/^["']+|["']+$/g, '').trim();
+    }
 
-      resetUI();
-      progressContainer.style.display = 'block';
-      this.disabled = true;
-      document.getElementById('btn-structure').disabled = true;
+    function showToast(msg) {
+      dom.toast.innerText = msg;
+      dom.toast.classList.add('show');
+      setTimeout(() => dom.toast.classList.remove('show'), 2000);
+    }
 
-      const eventSource = new EventSource(`?action=generate&path=${encodeURIComponent(path)}`);
+    // --- BOOKMARK LOGIC ---
+    window.onload = loadBookmarks;
 
-      eventSource.addEventListener('log', e => addLog(JSON.parse(e.data).message));
-      eventSource.addEventListener('progress', e => {
-        const d = JSON.parse(e.data);
-        progressBarInner.style.width = d.progress + '%';
-        progressBarInner.textContent = d.progress + '%';
+    async function loadBookmarks() {
+      const res = await fetch('?action=get_bookmarks');
+      const data = await res.json();
+      dom.bmList.innerHTML = '';
+      const items = Object.values(data).sort((a, b) => b.created_at.localeCompare(a.created_at));
+
+      if (items.length === 0) dom.bmList.innerHTML = '<div style="color:#94a3b8; font-size:0.8rem; text-align:center;">Trống</div>';
+
+      items.forEach(bm => {
+        const div = document.createElement('div');
+        div.className = 'bm-item';
+        div.innerHTML = `
+                <div class="bm-name" onclick="setPath('${encodeURIComponent(bm.path)}')">${bm.note || 'No Name'}</div>
+                <div class="bm-path" title="${bm.path}">${bm.path}</div>
+                <button class="bm-del" onclick="delBookmark('${bm.id}')">×</button>
+            `;
+        dom.bmList.appendChild(div);
       });
-      eventSource.addEventListener('error', e => {
-        addLog(JSON.parse(e.data).message, 'error');
-        endProcess(eventSource);
-      });
-      eventSource.addEventListener('complete', e => {
-        const d = JSON.parse(e.data);
-        progressBarInner.style.width = '100%';
-        progressBarInner.textContent = 'Hoàn thành';
-        document.getElementById('download-link').href = `?download=${encodeURIComponent(d.message)}`;
-        resultDownload.style.display = 'block';
-        addLog(`✅ Xong! Tổng cộng ${d.total} files.`);
-        endProcess(eventSource);
-      });
-      eventSource.onerror = () => {
-        addLog('Lỗi kết nối server.', 'error');
-        endProcess(eventSource);
-      };
-    });
+    }
 
-    // --- LOGIC STRUCTURE ONLY (AJAX) ---
-    document.getElementById('btn-structure').addEventListener('click', function() {
-      const path = pathInput.value.trim();
-      if (!path) return alert('Vui lòng nhập đường dẫn!');
+    function setPath(path) {
+      dom.path.value = decodeURIComponent(path);
+      // Visual feedback
+      dom.path.focus();
+      dom.path.style.borderColor = 'var(--primary)';
+      setTimeout(() => dom.path.style.borderColor = '', 500);
+    }
 
-      const btn = this;
-      btn.disabled = true;
-      btn.textContent = 'Đang quét...';
-
-      fetch(`?action=get_structure&path=${encodeURIComponent(path)}`)
-        .then(res => res.json())
-        .then(data => {
-          if (data.status === 'success') {
-            openModal(data.data);
-          } else {
-            alert('Lỗi: ' + data.message);
-          }
+    async function addBookmark() {
+      cleanInput(dom.path);
+      if (!dom.path.value) return alert('Nhập Path trước!');
+      await fetch('?action=save_bookmark', {
+        method: 'POST',
+        body: JSON.stringify({
+          path: dom.path.value,
+          note: dom.note.value
         })
-        .catch(err => alert('Lỗi kết nối: ' + err))
-        .finally(() => {
-          btn.disabled = false;
-          btn.textContent = '🌳 Chỉ lấy Structure Tree';
-        });
-    });
-
-    // --- HELPER FUNCTIONS ---
-    function resetUI() {
-      logDiv.innerHTML = '';
-      progressBarInner.style.width = '0%';
-      resultDownload.style.display = 'none';
-      progressBarInner.style.backgroundColor = '#27ae60';
+      });
+      dom.note.value = '';
+      loadBookmarks();
     }
 
-    function addLog(msg, type = 'info') {
-      const div = document.createElement('div');
-      div.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
-      if (type === 'error') div.style.color = '#e74c3c';
-      logDiv.appendChild(div);
-      logDiv.scrollTop = logDiv.scrollHeight;
+    async function delBookmark(id) {
+      if (!confirm('Xóa bookmark này?')) return;
+      await fetch('?action=delete_bookmark', {
+        method: 'POST',
+        body: JSON.stringify({
+          id
+        })
+      });
+      loadBookmarks();
     }
 
-    function endProcess(es) {
-      es.close();
-      document.getElementById('btn-full').disabled = false;
-      document.getElementById('btn-structure').disabled = false;
+    // --- STRUCTURE LOGIC ---
+    async function getStructure() {
+      cleanInput(dom.path);
+      if (!dom.path.value) return alert('Nhập đường dẫn!');
+
+      dom.structContent.innerText = 'Đang quét...';
+      dom.modal.style.display = 'flex';
+
+      try {
+        const res = await fetch(`?action=get_structure&path=${encodeURIComponent(dom.path.value)}`);
+        const json = await res.json();
+        if (json.status === 'success') {
+          dom.structContent.innerText = json.data;
+        } else {
+          dom.structContent.innerText = 'Lỗi: ' + json.message;
+        }
+      } catch (e) {
+        dom.structContent.innerText = 'Lỗi kết nối server.';
+      }
     }
 
-    // --- MODAL & COPY LOGIC ---
-    const modal = document.getElementById('preview-modal');
-    const previewContent = document.getElementById('tree-preview-content');
-
-    function openModal(content) {
-      previewContent.textContent = content;
-      modal.style.display = 'flex';
+    function copyStructure() {
+      navigator.clipboard.writeText(dom.structContent.innerText);
+      showToast('✅ Đã copy Structure!');
     }
 
     function closeModal() {
-      modal.style.display = 'none';
-      document.getElementById('copy-status').style.display = 'none';
+      dom.modal.style.display = 'none';
     }
 
-    function copyTree() {
-      const text = previewContent.textContent;
-      // Copy dạng markdown block
-      const markdownText = "```text\n" + text + "\n```";
+    // --- GENERATE LOGIC (SSE) ---
+    function startGenerate() {
+      cleanInput(dom.path);
+      if (!dom.path.value) return alert('Nhập đường dẫn!');
 
-      navigator.clipboard.writeText(markdownText).then(() => {
-        const status = document.getElementById('copy-status');
-        status.style.display = 'block';
-        setTimeout(() => status.style.display = 'none', 2000);
-      }).catch(err => alert('Không thể copy: ' + err));
+      // Reset UI
+      dom.editor.value = '';
+      dom.statusPanel.style.display = 'block';
+      dom.btnGen.disabled = true;
+      dom.btnCopy.disabled = true;
+      dom.btnDl.style.pointerEvents = 'none';
+      dom.btnDl.style.opacity = '0.6';
+      dom.badge.innerText = 'Generating...';
+
+      const es = new EventSource(`?action=generate&path=${encodeURIComponent(dom.path.value)}`);
+
+      es.addEventListener('log', e => {
+        const d = JSON.parse(e.data);
+        dom.logText.innerText = d.message;
+      });
+
+      es.addEventListener('progress', e => {
+        const d = JSON.parse(e.data);
+        dom.pFill.style.width = d.percent + '%';
+        dom.pText.innerText = d.percent + '%';
+        dom.logText.innerText = d.message;
+      });
+
+      es.addEventListener('complete', e => {
+        const d = JSON.parse(e.data);
+        const fileName = d.message; // Tên file temp
+
+        dom.pFill.style.width = '100%';
+        dom.pText.innerText = '100%';
+        dom.logText.innerText = 'Hoàn tất! Đang tải nội dung...';
+
+        // Fetch nội dung file về editor
+        fetch(`?action=get_content&file=${fileName}`)
+          .then(res => res.text())
+          .then(text => {
+            dom.editor.value = text;
+            dom.badge.innerText = `${d.total} files`;
+
+            // Kích hoạt nút download & copy
+            dom.btnCopy.disabled = false;
+            dom.btnDl.href = `?download=${fileName}`;
+            dom.btnDl.style.pointerEvents = 'auto';
+            dom.btnDl.style.opacity = '1';
+
+            // Ẩn panel status sau 1s
+            setTimeout(() => dom.statusPanel.style.display = 'none', 1000);
+          });
+
+        es.close();
+        dom.btnGen.disabled = false;
+      });
+
+      es.addEventListener('error', e => {
+        const d = JSON.parse(e.data);
+        alert('Lỗi: ' + d.message);
+        es.close();
+        dom.btnGen.disabled = false;
+        dom.statusPanel.style.display = 'none';
+      });
+
+      es.onerror = () => {
+        es.close();
+        dom.btnGen.disabled = false;
+      };
     }
 
-    // Đóng modal khi click ra ngoài
-    modal.addEventListener('click', (e) => {
-      if (e.target === modal) closeModal();
-    });
+    function copyContent() {
+      // Copy toàn bộ nội dung trong editor (đã là Markdown)
+      dom.editor.select();
+      document.execCommand('copy');
+      window.getSelection().removeAllRanges();
+      showToast('✅ Đã copy toàn bộ Docs!');
+    }
+
+    // Close modal on outside click
+    window.onclick = e => {
+      if (e.target == dom.modal) closeModal();
+    }
   </script>
 </body>
 
