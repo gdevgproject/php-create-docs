@@ -247,11 +247,16 @@ function handle_generation_request()
 
     send_sse('log', "📦 Tìm thấy {$totalFiles} file. Đang xử lý...");
 
+    // --- BIẾN ĐẾM DÒNG CODE ---
+    $totalLines = 0;
+
     // Tạo nội dung Markdown
     $projectName = basename($projectPath);
     $markdown = "# Tài liệu dự án: " . $projectName . "\n\n";
     $markdown .= "Ngày tạo: " . date('Y-m-d H:i:s') . "\n";
-    $markdown .= "Tổng số file: " . $totalFiles . "\n\n";
+
+    // Sử dụng Placeholder {{TOTAL_LINES}} để điền sau khi đếm xong
+    $markdown .= "Thống kê: " . $totalFiles . " files | {{TOTAL_LINES}} dòng code\n\n";
 
     // Phần 1: Cấu trúc cây
     $treeString = '';
@@ -278,6 +283,14 @@ function handle_generation_request()
         $markdown .= "> _[File Binary/Media - Không hiển thị nội dung]_\n\n";
       } else {
         $content = @file_get_contents($filePath);
+
+        // --- LOGIC ĐẾM DÒNG ---
+        if ($content !== false) {
+          // Nếu file không rỗng, đếm số ký tự xuống dòng + 1
+          $linesInFile = empty($content) ? 0 : substr_count($content, "\n") + 1;
+          $totalLines += $linesInFile;
+        }
+
         if ($content === false) {
           $markdown .= "> _[Lỗi đọc file]_\n\n";
         } elseif (strlen($content) > 512 * 1024) { // > 512KB
@@ -288,6 +301,10 @@ function handle_generation_request()
         }
       }
     }
+
+    // --- THAY THẾ PLACEHOLDER BẰNG SỐ LIỆU THỰC ---
+    $formattedLines = number_format($totalLines, 0, '.', ','); // Ví dụ: 1,234
+    $markdown = str_replace('{{TOTAL_LINES}}', $formattedLines, $markdown);
 
     // Lưu file vào thư mục temp của PHP
     $safeName = preg_replace('/[^A-Za-z0-9_\-]/', '_', $projectName);
