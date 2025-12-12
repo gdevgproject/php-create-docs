@@ -5,7 +5,7 @@
 set_time_limit(0);
 error_reporting(E_ALL);
 ini_set('display_errors', 0);
-ini_set('memory_limit', '512M'); // Tăng bộ nhớ để xử lý chuỗi lớn
+ini_set('memory_limit', '1024M'); // Tăng lên 1GB để xử lý file lớn không bị crash
 
 // Tắt bộ đệm để SSE hoạt động mượt mà
 if (function_exists('apache_setenv')) {
@@ -17,9 +17,10 @@ ob_implicit_flush(1);
 
 // File lưu trữ bookmark & Temp folder
 $bookmarkFile = __DIR__ . '/saved_paths.json';
-$tempDir = __DIR__ . '/temp_docs'; // Nơi lưu file tạm
+$tempDir = __DIR__ . '/temp_docs';
 
 // --- DANH SÁCH LOẠI TRỪ (EXCLUSIONS) ---
+// AI Expert Note: Giữ nguyên danh sách này để lọc rác hệ thống
 const EXCLUDED_DIRS = [
   'node_modules',
   '.next',
@@ -43,7 +44,7 @@ const EXCLUDED_FILES = [
   '.env',
   '.env.local',
   '.env.example',
-  '.env.production', // Sensitive
+  '.env.production',
   'package-lock.json',
   'composer.lock',
   'yarn.lock',
@@ -51,11 +52,12 @@ const EXCLUDED_FILES = [
   '.DS_Store',
   'Thumbs.db',
   'desktop.ini',
-  'tsconfig.tsbuildinfo', // Build info garbage
+  'tsconfig.tsbuildinfo',
   'mix-manifest.json',
   'manifest.json'
 ];
 
+// Danh sách file Binary/Media (Chỉ lấy structure, không lấy content)
 const BINARY_EXTENSIONS = [
   'png',
   'jpg',
@@ -148,13 +150,13 @@ if ($action === 'delete_bookmark') {
   json_response(['status' => 'error']);
 }
 
-// 4. API: Lấy Structure Tree (JSON)
+// 4. API: Lấy Structure Tree
 if ($action === 'get_structure') {
   $path = clean_path($_GET['path'] ?? '');
   if (!is_dir($path)) json_response(['status' => 'error', 'message' => 'Đường dẫn không hợp lệ.']);
 
   try {
-    $files = scan_project_files($path);
+    $files = scan_project_files($path); // Quét toàn bộ (bao gồm cả binary)
     $treeString = '';
     generate_directory_tree($path, $files, $treeString);
     json_response(['status' => 'success', 'data' => $treeString, 'count' => count($files)]);
@@ -163,7 +165,7 @@ if ($action === 'get_structure') {
   }
 }
 
-// 5. API: Lấy nội dung file đã generate (cho Preview)
+// 5. API: Lấy nội dung file preview
 if ($action === 'get_content') {
   $filename = basename($_GET['file']);
   $filePath = $tempDir . '/' . $filename;
@@ -175,20 +177,29 @@ if ($action === 'get_content') {
   exit;
 }
 
-// 6. SSE: Generate Full Docs
+// 6. API: Lấy danh sách Exclusion (để hiển thị UI)
+if ($action === 'get_exclusions') {
+  json_response([
+    'dirs' => EXCLUDED_DIRS,
+    'files' => EXCLUDED_FILES,
+    'extensions' => BINARY_EXTENSIONS
+  ]);
+}
+
+// 7. SSE: Generate Full Docs
 if ($action === 'generate') {
   handle_generation_request();
   exit;
 }
 
-// 7. Download File
+// 8. Download File
 if (isset($_GET['download'])) {
   handle_download_request();
   exit;
 }
 
 // =================================================================================
-// LOGIC CHÍNH
+// LOGIC CHÍNH & HÀM HỖ TRỢ
 // =================================================================================
 
 function clean_path($path)
@@ -216,6 +227,22 @@ function json_response($data)
   exit;
 }
 
+// --- HÀM LÀM SẠCH CODE (OPTIMIZE TOKEN) ---
+function sanitize_content($content)
+{
+  // 1. Chuẩn hóa dòng mới về \n
+  $content = str_replace(["\r\n", "\r"], "\n", $content);
+
+  // 2. Xóa khoảng trắng thừa ở cuối mỗi dòng (Right Trim)
+  $content = preg_replace('/[ \t]+$/m', '', $content);
+
+  // 3. Gộp nhiều dòng trống liên tiếp (>=3 dòng) thành 2 dòng
+  // Giúp code gọn hơn nhưng vẫn giữ phân đoạn logic
+  $content = preg_replace('/\n{3,}/', "\n\n", $content);
+
+  return $content; // Trả về toàn bộ, không cắt ngắn
+}
+
 function handle_generation_request()
 {
   global $tempDir;
@@ -227,19 +254,15 @@ function handle_generation_request()
 
   try {
     if (!is_dir($projectPath)) throw new Exception("Đường dẫn không tồn tại.");
-
-    // Tạo thư mục temp nếu chưa có
     if (!is_dir($tempDir)) mkdir($tempDir, 0777, true);
 
-    // Dọn dẹp file cũ trong temp (để tiết kiệm dung lượng)
+    // Dọn dẹp file cũ
     $oldFiles = glob($tempDir . '/docs_*.md');
     foreach ($oldFiles as $f) {
-      if (is_file($f) && (time() - filemtime($f) > 3600)) { // Xóa file cũ hơn 1 tiếng
-        unlink($f);
-      }
+      if (is_file($f) && (time() - filemtime($f) > 3600)) unlink($f);
     }
 
-    send_sse('log', '🚀 Bắt đầu quét file...');
+    send_sse('log', '🚀 Bắt đầu quét dự án...');
     $files = scan_project_files($projectPath);
     $totalFiles = count($files);
 
@@ -247,75 +270,87 @@ function handle_generation_request()
 
     send_sse('log', "📦 Tìm thấy {$totalFiles} file. Đang xử lý...");
 
-    // --- BIẾN ĐẾM DÒNG CODE ---
-    $totalLines = 0;
-
-    // Tạo nội dung Markdown
     $projectName = basename($projectPath);
-    $markdown = "# Tài liệu dự án: " . $projectName . "\n\n";
-    $markdown .= "Ngày tạo: " . date('Y-m-d H:i:s') . "\n";
 
-    // Sử dụng Placeholder {{TOTAL_LINES}} để điền sau khi đếm xong
-    $markdown .= "Thống kê: " . $totalFiles . " files | {{TOTAL_LINES}} dòng code\n\n";
+    // --- 1. SYSTEM PROMPT & HEADER ---
+    // Format XML giúp AI hiểu cấu trúc tốt hơn Markdown thuần
+    $output = "# DOCUMENTATION: " . $projectName . "\n";
+    $output .= "Generated: " . date('Y-m-d H:i:s') . "\n\n";
 
-    // Phần 1: Cấu trúc cây
+    $output .= "## SYSTEM INSTRUCTION (Prompt)\n";
+    $output .= "You are an expert AI assistant. The following text contains the full source code of a project.\n";
+    $output .= "1. **Structure**: Refer to the 'Directory Tree' for file organization.\n";
+    $output .= "2. **Content**: Source code is wrapped in `<file>` tags with `path` attributes.\n";
+    $output .= "3. **Syntax**: Code content is enclosed in `<![CDATA[ ... ]]>` to preserve characters.\n";
+    $output .= "4. **Binary**: Binary/Media files are listed in the tree but their content is excluded to save tokens.\n\n";
+
+    // --- 2. STRUCTURE TREE ---
     $treeString = '';
     generate_directory_tree($projectPath, $files, $treeString);
-    $markdown .= "## 🌳 Cấu trúc thư mục\n\n```text\n" . $treeString . "```\n\n";
+    $output .= "## 1. DIRECTORY TREE\n";
+    $output .= "```text\n" . $treeString . "```\n\n";
 
-    // Phần 2: Nội dung chi tiết
-    $markdown .= "## 📄 Nội dung chi tiết\n\n";
+    $output .= "## 2. SOURCE CODE CONTENT\n\n";
+    // Mở thẻ root XML ảo để AI dễ parse
+    $output .= "<project_codebase>\n\n";
+
+    $totalLines = 0;
 
     foreach ($files as $index => $filePath) {
       $processedCount = $index + 1;
       $relativePath = ltrim(str_replace(str_replace('\\', '/', $projectPath), '', str_replace('\\', '/', $filePath)), '/');
 
-      // SSE Progress
+      // SSE Progress update
       if ($processedCount % 5 == 0 || $processedCount == $totalFiles) {
         $percent = round(($processedCount / $totalFiles) * 100);
-        send_sse('progress', "Đang đọc: $relativePath", ['percent' => $percent]);
+        send_sse('progress', "Reading: $relativePath", ['percent' => $percent]);
       }
 
       $ext = strtolower(pathinfo($filePath, PATHINFO_EXTENSION));
-      $markdown .= "### `{$relativePath}`\n\n";
 
+      // Bắt đầu khối file
+      $output .= "<file path=\"{$relativePath}\">\n";
+
+      // Logic xử lý nội dung
       if (in_array($ext, BINARY_EXTENSIONS)) {
-        $markdown .= "> _[File Binary/Media - Không hiển thị nội dung]_\n\n";
+        // File nhị phân: Chỉ giữ thẻ, không lấy nội dung
+        $output .= "    <!-- [BINARY/MEDIA FILE - CONTENT EXCLUDED] -->\n";
       } else {
         $content = @file_get_contents($filePath);
 
-        // --- LOGIC ĐẾM DÒNG ---
-        if ($content !== false) {
-          // Nếu file không rỗng, đếm số ký tự xuống dòng + 1
+        if ($content === false) {
+          $output .= "    <!-- [ERROR READING FILE] -->\n";
+        } else {
+          // Đếm dòng
           $linesInFile = empty($content) ? 0 : substr_count($content, "\n") + 1;
           $totalLines += $linesInFile;
-        }
 
-        if ($content === false) {
-          $markdown .= "> _[Lỗi đọc file]_\n\n";
-        } elseif (strlen($content) > 512 * 1024) { // > 512KB
-          $markdown .= "> _[File quá lớn (>512KB) - Đã ẩn nội dung]_\n\n";
-        } else {
-          if (empty($ext)) $ext = 'text';
-          $markdown .= "```{$ext}\n" . $content . "\n```\n\n";
+          // Làm sạch (Sanitize) nhưng KHÔNG CẮT NGẮN
+          $cleanContent = sanitize_content($content);
+
+          // Dùng CDATA để bọc code an toàn
+          $output .= "<![CDATA[\n";
+          $output .= $cleanContent . "\n";
+          $output .= "]]>\n";
         }
       }
+      $output .= "</file>\n\n";
     }
 
-    // --- THAY THẾ PLACEHOLDER BẰNG SỐ LIỆU THỰC ---
-    $formattedLines = number_format($totalLines, 0, '.', ','); // Ví dụ: 1,234
-    $markdown = str_replace('{{TOTAL_LINES}}', $formattedLines, $markdown);
+    $output .= "</project_codebase>\n";
 
-    // Lưu file vào thư mục temp của PHP
+    // Thêm thống kê cuối file
+    $output .= "\n<!-- Stats: {$totalFiles} files | " . number_format($totalLines) . " lines of code -->";
+
+    // Lưu file
     $safeName = preg_replace('/[^A-Za-z0-9_\-]/', '_', $projectName);
     $fileName = 'docs_' . $safeName . '_' . date('Ymd_His') . '.md';
     $tempFilePath = $tempDir . '/' . $fileName;
 
-    if (file_put_contents($tempFilePath, $markdown) === false) {
+    if (file_put_contents($tempFilePath, $output) === false) {
       throw new Exception("Lỗi ghi file tạm.");
     }
 
-    // Trả về tên file để client tải hoặc preview
     send_sse('complete', $fileName, ['total' => $totalFiles]);
   } catch (Throwable $e) {
     send_sse('error', $e->getMessage());
@@ -330,6 +365,7 @@ function scan_project_files($dir)
       new RecursiveDirectoryIterator($dir, FilesystemIterator::SKIP_DOTS | FilesystemIterator::UNIX_PATHS),
       function ($current, $key, $iterator) {
         $filename = $current->getFilename();
+        // Check Exclusions
         if ($current->isDir()) return !in_array($filename, EXCLUDED_DIRS);
         if ($current->isFile()) return !in_array($filename, EXCLUDED_FILES);
         return true;
@@ -410,7 +446,7 @@ function handle_download_request()
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Smart Docs Generator</title>
+  <title>Expert Docs Generator</title>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
   <style>
     :root {
@@ -462,7 +498,6 @@ function handle_download_request()
       gap: 10px;
     }
 
-    /* FORM */
     .input-group {
       margin-bottom: 15px;
     }
@@ -573,6 +608,7 @@ function handle_download_request()
       font-weight: 600;
       font-size: 0.9rem;
       margin-bottom: 4px;
+      cursor: pointer;
     }
 
     .bm-path {
@@ -615,7 +651,6 @@ function handle_download_request()
       position: relative;
     }
 
-    /* PREVIEW AREA */
     .preview-container {
       flex: 1;
       display: flex;
@@ -671,7 +706,6 @@ function handle_download_request()
       outline: none;
     }
 
-    /* ACTIONS BAR */
     .actions {
       display: flex;
       gap: 10px;
@@ -700,7 +734,7 @@ function handle_download_request()
       transform: translateY(0);
     }
 
-    /* PROGRESS & LOGS OVERLAY */
+    /* OVERLAY */
     .overlay-status {
       position: absolute;
       bottom: 30px;
@@ -740,7 +774,7 @@ function handle_download_request()
       text-overflow: ellipsis;
     }
 
-    /* MODAL (Structure) */
+    /* MODAL */
     .modal {
       display: none;
       position: fixed;
@@ -761,6 +795,15 @@ function handle_download_request()
       overflow: hidden;
     }
 
+    .modal-head {
+      padding: 15px 20px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-weight: 600;
+    }
+
     .modal-body {
       flex: 1;
       padding: 20px;
@@ -771,13 +814,38 @@ function handle_download_request()
       white-space: pre;
     }
 
-    .modal-head {
-      padding: 15px 20px;
-      border-bottom: 1px solid var(--border);
+    /* EXCLUSION LIST STYLE */
+    .ex-list {
       display: flex;
-      justify-content: space-between;
-      align-items: center;
-      font-weight: 600;
+      flex-wrap: wrap;
+      gap: 5px;
+      margin-bottom: 15px;
+    }
+
+    .ex-tag {
+      background: #fee2e2;
+      color: #991b1b;
+      padding: 2px 8px;
+      border-radius: 4px;
+      font-size: 0.8rem;
+      border: 1px solid #fecaca;
+    }
+
+    .ex-tag.bin {
+      background: #e0f2fe;
+      color: #075985;
+      border-color: #bae6fd;
+    }
+
+    .ex-section {
+      margin-bottom: 20px;
+    }
+
+    .ex-title {
+      font-weight: 700;
+      margin-bottom: 8px;
+      font-size: 0.9rem;
+      color: var(--text);
     }
   </style>
 </head>
@@ -786,17 +854,19 @@ function handle_download_request()
 
   <!-- LEFT SIDEBAR -->
   <div class="sidebar">
-    <div class="brand">🚀 Docs Generator</div>
+    <div class="brand">🚀 Expert Docs</div>
 
     <div class="input-group">
       <label>📂 Project Path</label>
       <input type="text" id="path-input" class="input-control" placeholder="C:\laragon\www\my-project" onblur="cleanInput(this)">
     </div>
 
-    <div style="display: flex; gap: 10px; margin-bottom: 15px;">
+    <div style="display: flex; gap: 10px; margin-bottom: 10px;">
       <button class="btn btn-secondary" onclick="getStructure()">🌳 Structure</button>
       <button class="btn btn-primary" id="btn-gen" onclick="startGenerate()">⚡ Generate</button>
     </div>
+
+    <button class="btn btn-outline btn-sm" onclick="showExclusions()" style="margin-bottom: 15px;">🚫 Ignored List</button>
 
     <div class="input-group" style="margin-top: auto; border-top: 1px dashed var(--border); padding-top: 15px;">
       <label>🔖 Bookmark Note</label>
@@ -820,12 +890,12 @@ function handle_download_request()
           📄 Preview <span class="badge" id="file-badge">Empty</span>
         </div>
         <div class="actions">
-          <button class="btn btn-outline btn-sm" onclick="copyContent()" id="btn-copy" disabled>📋 Copy Markdown</button>
-          <a href="#" id="btn-download" class="btn btn-primary btn-sm" style="text-decoration: none; pointer-events: none; opacity: 0.6;">⬇️ Download .MD</a>
+          <button class="btn btn-outline btn-sm" onclick="copyContent()" id="btn-copy" disabled>📋 Copy XML/MD</button>
+          <a href="#" id="btn-download" class="btn btn-primary btn-sm" style="text-decoration: none; pointer-events: none; opacity: 0.6;">⬇️ Download</a>
         </div>
       </div>
       <div class="editor-wrapper">
-        <textarea id="editor" class="code-editor" readonly placeholder="Nội dung docs sẽ hiện ở đây..."></textarea>
+        <textarea id="editor" class="code-editor" readonly placeholder="Nội dung docs (XML Format) sẽ hiện ở đây..."></textarea>
       </div>
     </div>
 
@@ -849,9 +919,9 @@ function handle_download_request()
   <div class="modal" id="modal-struct">
     <div class="modal-box">
       <div class="modal-head">
-        <span>🌳 Project Structure</span>
+        <span id="modal-title">🌳 Project Structure</span>
         <div style="display: flex; gap: 10px;">
-          <button class="btn btn-secondary btn-sm" style="width: auto" onclick="copyStructure()">📋 Copy Raw</button>
+          <button class="btn btn-secondary btn-sm" style="width: auto" id="btn-copy-modal" onclick="copyStructure()">📋 Copy</button>
           <button class="btn btn-outline btn-sm" style="width: auto" onclick="closeModal()">✕</button>
         </div>
       </div>
@@ -860,7 +930,6 @@ function handle_download_request()
   </div>
 
   <script>
-    // DOM Elements
     const dom = {
       path: document.getElementById('path-input'),
       note: document.getElementById('bm-note'),
@@ -875,13 +944,13 @@ function handle_download_request()
       btnDl: document.getElementById('btn-download'),
       badge: document.getElementById('file-badge'),
       modal: document.getElementById('modal-struct'),
+      modalTitle: document.getElementById('modal-title'),
       structContent: document.getElementById('struct-content'),
+      btnCopyModal: document.getElementById('btn-copy-modal'),
       toast: document.getElementById('toast')
     };
 
-    // --- UTILS ---
     function cleanInput(el) {
-      // Tự động xóa dấu ngoặc kép khi paste
       el.value = el.value.replace(/^["']+|["']+$/g, '').trim();
     }
 
@@ -891,37 +960,30 @@ function handle_download_request()
       setTimeout(() => dom.toast.classList.remove('show'), 2000);
     }
 
-    // --- BOOKMARK LOGIC ---
+    // --- BOOKMARKS ---
     window.onload = loadBookmarks;
-
     async function loadBookmarks() {
       const res = await fetch('?action=get_bookmarks');
       const data = await res.json();
       dom.bmList.innerHTML = '';
       const items = Object.values(data).sort((a, b) => b.created_at.localeCompare(a.created_at));
-
       if (items.length === 0) dom.bmList.innerHTML = '<div style="color:#94a3b8; font-size:0.8rem; text-align:center;">Trống</div>';
-
       items.forEach(bm => {
         const div = document.createElement('div');
         div.className = 'bm-item';
-        div.innerHTML = `
-                <div class="bm-name" onclick="setPath('${encodeURIComponent(bm.path)}')">${bm.note || 'No Name'}</div>
-                <div class="bm-path" title="${bm.path}">${bm.path}</div>
-                <button class="bm-del" onclick="delBookmark('${bm.id}')">×</button>
-            `;
+        div.innerHTML = `<div class="bm-name" onclick="setPath('${encodeURIComponent(bm.path)}')">${bm.note || 'No Name'}</div>
+                             <div class="bm-path" title="${bm.path}">${bm.path}</div>
+                             <button class="bm-del" onclick="delBookmark('${bm.id}')">×</button>`;
         dom.bmList.appendChild(div);
       });
     }
 
     function setPath(path) {
       dom.path.value = decodeURIComponent(path);
-      // Visual feedback
       dom.path.focus();
       dom.path.style.borderColor = 'var(--primary)';
       setTimeout(() => dom.path.style.borderColor = '', 500);
     }
-
     async function addBookmark() {
       cleanInput(dom.path);
       if (!dom.path.value) return alert('Nhập Path trước!');
@@ -935,54 +997,67 @@ function handle_download_request()
       dom.note.value = '';
       loadBookmarks();
     }
-
     async function delBookmark(id) {
-      if (!confirm('Xóa bookmark này?')) return;
-      await fetch('?action=delete_bookmark', {
-        method: 'POST',
-        body: JSON.stringify({
-          id
-        })
-      });
-      loadBookmarks();
+      if (confirm('Xóa bookmark?')) {
+        await fetch('?action=delete_bookmark', {
+          method: 'POST',
+          body: JSON.stringify({
+            id
+          })
+        });
+        loadBookmarks();
+      }
     }
 
-    // --- STRUCTURE LOGIC ---
+    // --- STRUCTURE & EXCLUSIONS ---
     async function getStructure() {
       cleanInput(dom.path);
       if (!dom.path.value) return alert('Nhập đường dẫn!');
-
+      dom.modalTitle.innerText = "🌳 Project Structure";
       dom.structContent.innerText = 'Đang quét...';
+      dom.btnCopyModal.style.display = 'block';
       dom.modal.style.display = 'flex';
-
       try {
         const res = await fetch(`?action=get_structure&path=${encodeURIComponent(dom.path.value)}`);
         const json = await res.json();
-        if (json.status === 'success') {
-          dom.structContent.innerText = json.data;
-        } else {
-          dom.structContent.innerText = 'Lỗi: ' + json.message;
-        }
+        dom.structContent.innerText = json.status === 'success' ? json.data : 'Lỗi: ' + json.message;
       } catch (e) {
         dom.structContent.innerText = 'Lỗi kết nối server.';
       }
     }
 
+    async function showExclusions() {
+      dom.modalTitle.innerText = "🚫 Ignored Settings (Hardcoded)";
+      dom.structContent.innerHTML = 'Loading...';
+      dom.btnCopyModal.style.display = 'none'; // Không cần copy nút này
+      dom.modal.style.display = 'flex';
+      try {
+        const res = await fetch('?action=get_exclusions');
+        const d = await res.json();
+        let html = `
+                <div class="ex-section"><div class="ex-title">Directories (Folders)</div><div class="ex-list">${d.dirs.map(x=>`<span class="ex-tag">${x}</span>`).join('')}</div></div>
+                <div class="ex-section"><div class="ex-title">Files</div><div class="ex-list">${d.files.map(x=>`<span class="ex-tag">${x}</span>`).join('')}</div></div>
+                <div class="ex-section"><div class="ex-title">Binary Extensions (Structure only, No content)</div><div class="ex-list">${d.extensions.map(x=>`<span class="ex-tag bin">${x}</span>`).join('')}</div></div>
+            `;
+        dom.structContent.innerHTML = html;
+      } catch (e) {
+        dom.structContent.innerText = 'Lỗi tải thông tin.';
+      }
+    }
+
     function copyStructure() {
       navigator.clipboard.writeText(dom.structContent.innerText);
-      showToast('✅ Đã copy Structure!');
+      showToast('✅ Copied Structure!');
     }
 
     function closeModal() {
       dom.modal.style.display = 'none';
     }
 
-    // --- GENERATE LOGIC (SSE) ---
+    // --- GENERATE SSE ---
     function startGenerate() {
       cleanInput(dom.path);
       if (!dom.path.value) return alert('Nhập đường dẫn!');
-
-      // Reset UI
       dom.editor.value = '';
       dom.statusPanel.style.display = 'block';
       dom.btnGen.disabled = true;
@@ -993,55 +1068,36 @@ function handle_download_request()
 
       const es = new EventSource(`?action=generate&path=${encodeURIComponent(dom.path.value)}`);
 
-      es.addEventListener('log', e => {
-        const d = JSON.parse(e.data);
-        dom.logText.innerText = d.message;
-      });
-
+      es.addEventListener('log', e => dom.logText.innerText = JSON.parse(e.data).message);
       es.addEventListener('progress', e => {
         const d = JSON.parse(e.data);
         dom.pFill.style.width = d.percent + '%';
         dom.pText.innerText = d.percent + '%';
         dom.logText.innerText = d.message;
       });
-
       es.addEventListener('complete', e => {
         const d = JSON.parse(e.data);
-        const fileName = d.message; // Tên file temp
-
         dom.pFill.style.width = '100%';
         dom.pText.innerText = '100%';
         dom.logText.innerText = 'Hoàn tất! Đang tải nội dung...';
-
-        // Fetch nội dung file về editor
-        fetch(`?action=get_content&file=${fileName}`)
-          .then(res => res.text())
-          .then(text => {
-            dom.editor.value = text;
-            dom.badge.innerText = `${d.total} files`;
-
-            // Kích hoạt nút download & copy
-            dom.btnCopy.disabled = false;
-            dom.btnDl.href = `?download=${fileName}`;
-            dom.btnDl.style.pointerEvents = 'auto';
-            dom.btnDl.style.opacity = '1';
-
-            // Ẩn panel status sau 1s
-            setTimeout(() => dom.statusPanel.style.display = 'none', 1000);
-          });
-
+        fetch(`?action=get_content&file=${d.message}`).then(res => res.text()).then(text => {
+          dom.editor.value = text;
+          dom.badge.innerText = `${d.total} files`;
+          dom.btnCopy.disabled = false;
+          dom.btnDl.href = `?download=${d.message}`;
+          dom.btnDl.style.pointerEvents = 'auto';
+          dom.btnDl.style.opacity = '1';
+          setTimeout(() => dom.statusPanel.style.display = 'none', 1000);
+        });
         es.close();
         dom.btnGen.disabled = false;
       });
-
       es.addEventListener('error', e => {
-        const d = JSON.parse(e.data);
-        alert('Lỗi: ' + d.message);
+        alert('Lỗi: ' + JSON.parse(e.data).message);
         es.close();
         dom.btnGen.disabled = false;
         dom.statusPanel.style.display = 'none';
       });
-
       es.onerror = () => {
         es.close();
         dom.btnGen.disabled = false;
@@ -1049,14 +1105,11 @@ function handle_download_request()
     }
 
     function copyContent() {
-      // Copy toàn bộ nội dung trong editor (đã là Markdown)
       dom.editor.select();
       document.execCommand('copy');
       window.getSelection().removeAllRanges();
-      showToast('✅ Đã copy toàn bộ Docs!');
+      showToast('✅ Copied Full Docs!');
     }
-
-    // Close modal on outside click
     window.onclick = e => {
       if (e.target == dom.modal) closeModal();
     }
