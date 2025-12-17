@@ -309,6 +309,9 @@ function handle_generation_request()
       $ext = strtolower(pathinfo($filePath, PATHINFO_EXTENSION));
 
       // Bắt đầu khối file
+      // Skip directory processing for content
+      if (is_dir($filePath)) continue;
+
       $output .= "<file path=\"{$relativePath}\">\n";
 
       // Logic xử lý nội dung
@@ -375,7 +378,7 @@ function scan_project_files($dir)
   );
 
   foreach ($iterator as $file) {
-    if ($file->isFile()) $results[] = $file->getPathname();
+    $results[] = $file->getPathname();
   }
   sort($results);
   return $results;
