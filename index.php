@@ -157,9 +157,13 @@ if ($action === 'get_structure') {
 
   try {
     $files = scan_project_files($path); // Quét toàn bộ (bao gồm cả binary)
-    $treeString = '';
+    $totalFiles = count($files);
+    $totalLines = count_project_lines($files);
+
+    $treeString = "<!-- Stats: {$totalFiles} files | " . number_format($totalLines) . " lines of code -->\n";
     generate_directory_tree($path, $files, $treeString);
-    json_response(['status' => 'success', 'data' => $treeString, 'count' => count($files)]);
+
+    json_response(['status' => 'success', 'data' => $treeString, 'count' => $totalFiles, 'lines' => $totalLines]);
   } catch (Exception $e) {
     json_response(['status' => 'error', 'message' => $e->getMessage()]);
   }
@@ -243,6 +247,30 @@ function sanitize_content($content)
   return $content; // Trả về toàn bộ, không cắt ngắn
 }
 
+function count_project_lines($files)
+{
+  $totalLines = 0;
+  foreach ($files as $filePath) {
+    if (is_dir($filePath)) {
+      continue;
+    }
+
+    $ext = strtolower(pathinfo($filePath, PATHINFO_EXTENSION));
+    if (in_array($ext, BINARY_EXTENSIONS)) {
+      continue;
+    }
+
+    $content = @file_get_contents($filePath);
+    if ($content === false) {
+      continue;
+    }
+
+    $totalLines += $content === '' ? 0 : substr_count($content, "\n") + 1;
+  }
+
+  return $totalLines;
+}
+
 function handle_generation_request()
 {
   global $tempDir;
@@ -256,10 +284,10 @@ function handle_generation_request()
     if (!is_dir($projectPath)) throw new Exception("Đường dẫn không tồn tại.");
     if (!is_dir($tempDir)) mkdir($tempDir, 0777, true);
 
-    // Dọn dẹp file cũ
+    // Dọn dẹp file cũ trước khi sinh file mới
     $oldFiles = glob($tempDir . '/docs_*.md');
     foreach ($oldFiles as $f) {
-      if (is_file($f) && (time() - filemtime($f) > 3600)) unlink($f);
+      if (is_file($f)) unlink($f);
     }
 
     send_sse('log', '🚀 Bắt đầu quét dự án...');
